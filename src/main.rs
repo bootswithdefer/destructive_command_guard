@@ -174,6 +174,7 @@ fn history_agent_type_for_protocol(protocol: hook::HookProtocol, detected_agent:
         hook::HookProtocol::Antigravity => Agent::Antigravity.config_key(),
         hook::HookProtocol::Crush => Agent::Crush.config_key(),
         hook::HookProtocol::Reasonix => Agent::Reasonix.config_key(),
+        hook::HookProtocol::Kiro => Agent::Kiro.config_key(),
         hook::HookProtocol::ClaudeCompatible => detected_agent.config_key(),
     }
 }
@@ -191,6 +192,7 @@ fn effective_agent_for_hook_protocol(
         hook::HookProtocol::Antigravity => Agent::Antigravity,
         hook::HookProtocol::Crush => Agent::Crush,
         hook::HookProtocol::Reasonix => Agent::Reasonix,
+        hook::HookProtocol::Kiro => Agent::Kiro,
         hook::HookProtocol::ClaudeCompatible => detected_agent.clone(),
     }
 }
@@ -254,6 +256,16 @@ fn format_indeterminate_reason(stage: &str, budget: Duration) -> String {
 /// best-effort: Claude Code feeds it back to the model on exit 2, and a host
 /// that closed stderr too simply gets the status.
 fn blocking_verdict_exit_code(protocol: hook::HookProtocol, delivery: io::Result<()>) -> i32 {
+    // Kiro is the one protocol whose block channel is the exit code itself:
+    // it reads no stdout decision (stdout on exit 0 is captured but never
+    // shown), so a successfully delivered — but empty — stdout is still an
+    // allow unless the status carries the block. Every blocking verdict under
+    // Kiro therefore exits `EXIT_HOOK_BLOCK` (2) regardless of delivery. The
+    // reason has already gone to stderr, which Kiro feeds back to the model on
+    // exit 2. A delivery error only reinforces the same status.
+    if matches!(protocol, hook::HookProtocol::Kiro) {
+        return protocol.undeliverable_block_exit_code();
+    }
     match delivery {
         // Reasonix reads only the exit status (#358): exit 0 would let the
         // command run whatever was written.
@@ -375,6 +387,7 @@ fn hook_protocol_for_agent(agent: &Agent) -> hook::HookProtocol {
         // Reasonix reads only the exit status: the Claude-shaped fallback
         // below would exit 0 and let the command run.
         Agent::Reasonix => hook::HookProtocol::Reasonix,
+        Agent::Kiro => hook::HookProtocol::Kiro,
         _ => hook::HookProtocol::ClaudeCompatible,
     }
 }
