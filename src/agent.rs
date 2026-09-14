@@ -39,6 +39,15 @@
 //! - Oh My Pi (`omp`): the generated OMP extension invokes dcg with the
 //!   explicit `--agent omp` flag (`dcg install --omp`). Exact `omp` and
 //!   `oh-my-pi` parent-process basenames are also recognized as a fallback.
+//! - Kiro (`kiro-cli`): `KIRO_SESSION_ID` env var, which Kiro sets in the
+//!   environment of every hook subprocess (its documented per-session UUID —
+//!   see Kiro's Hooks System / Session Management docs). Kiro invokes dcg as a
+//!   `preToolUse` hook whose stdin carries `hook_event_name: "preToolUse"`,
+//!   `tool_name: "execute_bash"` (aliases `shell` / `execute_cmd`), and
+//!   `tool_input.command`. Unlike every other supported agent, Kiro's block
+//!   contract is exit code 2 with STDERR fed back to the model — stdout on
+//!   exit 0 is captured but never shown — so its denial is emitted as an
+//!   exit-2 status rather than a stdout-JSON decision.
 //! - Pi (earendil-works `pi` coding agent): `PI_CODING_AGENT=true` env var (set
 //!   by `pi` into the environment of the subprocesses it spawns).
 //! - Posit Assistant: `PA_PROJECT_DIR=<workspace root>` env var, set in every
@@ -122,6 +131,14 @@ pub enum Agent {
     /// "tool_input":{"command":...}}` to the hook's stdin, and sets `CRUSH=1`
     /// in every hook and `bash`-tool subprocess (#388).
     Crush,
+    /// AWS Kiro (`kiro-cli`). Invokes dcg as a `preToolUse` hook whose stdin
+    /// carries `hook_event_name: "preToolUse"`, `tool_name: "execute_bash"`
+    /// (aliases `shell` / `execute_cmd`), and `tool_input.command`. Sets
+    /// `KIRO_SESSION_ID=<uuid>` in the hook subprocess environment. Blocks a
+    /// tool on hook exit code 2 with STDERR returned to the model as the
+    /// reason; stdout on exit 0 is captured but not shown, so dcg emits its
+    /// denial via exit 2 rather than a stdout-JSON decision.
+    Kiro,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -152,6 +169,7 @@ impl Agent {
             Self::OpenCode => "opencode",
             Self::Omp => "omp",
             Self::Crush => "crush",
+            Self::Kiro => "kiro",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -178,6 +196,7 @@ impl Agent {
                 | Self::OpenCode
                 | Self::Omp
                 | Self::Crush
+                | Self::Kiro
         )
     }
 
@@ -203,6 +222,7 @@ impl Agent {
     /// - `"posit-assistant"`, `"posit_assistant"`, `"posit"`, `"pa"` -> `PositAssistant`
     /// - `"omp"`, `"oh-my-pi"` -> `Omp`
     /// - `"crush"`, `"charm-crush"` -> `Crush`
+    /// - `"kiro"`, `"kiro-cli"`, `"kiro-ide"` -> `Kiro`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -225,6 +245,7 @@ impl Agent {
             "opencode" | "opencodecli" => Self::OpenCode,
             "omp" | "ohmypi" => Self::Omp,
             "crush" | "charmcrush" | "crushcli" => Self::Crush,
+            "kiro" | "kirocli" | "kiroide" => Self::Kiro,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -250,6 +271,7 @@ impl fmt::Display for Agent {
             Self::OpenCode => write!(f, "OpenCode"),
             Self::Omp => write!(f, "Oh My Pi"),
             Self::Crush => write!(f, "Crush"),
+            Self::Kiro => write!(f, "Kiro"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -654,6 +676,20 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // Kiro (`kiro-cli`) detection. Kiro sets `KIRO_SESSION_ID=<uuid>` in the
+    // environment of every hook subprocess (its documented per-session UUID;
+    // see Kiro's Hooks System / Session Management docs). Presence-only, like
+    // the other session markers above. Checked before Posit Assistant's
+    // workspace-scoped `PA_PROJECT_DIR` because `KIRO_SESSION_ID` names the
+    // direct caller.
+    if std::env::var("KIRO_SESSION_ID").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Kiro,
+            DetectionMethod::Environment,
+            Some("KIRO_SESSION_ID".to_string()),
+        ));
+    }
+
     // Posit Assistant detection. Its hook contract sets
     // `PA_PROJECT_DIR=<workspace root>` in every hook subprocess, which is what
     // dcg sees when invoked as a `PreToolUse` hook. Presence-only, like the
@@ -942,6 +978,7 @@ mod tests {
         assert_eq!(Agent::PositAssistant.config_key(), "posit-assistant");
         assert_eq!(Agent::OpenCode.config_key(), "opencode");
         assert_eq!(Agent::Omp.config_key(), "omp");
+        assert_eq!(Agent::Kiro.config_key(), "kiro");
         assert_eq!(Agent::Unknown.config_key(), "unknown");
         assert_eq!(
             Agent::Custom("my-agent".to_string()).config_key(),
@@ -1005,6 +1042,12 @@ mod tests {
         assert_eq!(Agent::from_name("OMP"), Agent::Omp);
         assert_eq!(Agent::from_name("oh-my-pi"), Agent::Omp);
         assert_eq!(Agent::from_name("oh_my_pi"), Agent::Omp);
+        assert_eq!(Agent::from_name("kiro"), Agent::Kiro);
+        assert_eq!(Agent::from_name("Kiro"), Agent::Kiro);
+        assert_eq!(Agent::from_name("KIRO"), Agent::Kiro);
+        assert_eq!(Agent::from_name("kiro-cli"), Agent::Kiro);
+        assert_eq!(Agent::from_name("kiro_cli"), Agent::Kiro);
+        assert_eq!(Agent::from_name("kiro-ide"), Agent::Kiro);
 
         // Custom agents
         assert_eq!(
@@ -1030,6 +1073,7 @@ mod tests {
         assert_eq!(format!("{}", Agent::PositAssistant), "Posit Assistant");
         assert_eq!(format!("{}", Agent::OpenCode), "OpenCode");
         assert_eq!(format!("{}", Agent::Omp), "Oh My Pi");
+        assert_eq!(format!("{}", Agent::Kiro), "Kiro");
         assert_eq!(format!("{}", Agent::Unknown), "Unknown");
         assert_eq!(
             format!("{}", Agent::Custom("MyAgent".to_string())),
@@ -1051,6 +1095,7 @@ mod tests {
         assert!(Agent::PositAssistant.is_known());
         assert!(Agent::OpenCode.is_known());
         assert!(Agent::Omp.is_known());
+        assert!(Agent::Kiro.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
     }
@@ -1386,6 +1431,7 @@ mod env_tests {
         "CRUSH",
         "PI_CODING_AGENT",
         "PA_PROJECT_DIR",
+        "KIRO_SESSION_ID",
     ];
 
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
@@ -1643,6 +1689,45 @@ mod env_tests {
             let result = detect_agent_with_details();
             assert_eq!(result.agent, Agent::Crush);
         });
+    }
+
+    #[test]
+    fn test_detect_kiro_session_id_env() {
+        // Kiro sets KIRO_SESSION_ID=<uuid> in every hook subprocess.
+        with_env_var(
+            "KIRO_SESSION_ID",
+            "550e8400-e29b-41d4-a716-446655440000",
+            || {
+                let result = detect_agent_with_details();
+                assert_eq!(result.agent, Agent::Kiro);
+                assert_eq!(result.method, DetectionMethod::Environment);
+                assert_eq!(result.matched_value, Some("KIRO_SESSION_ID".to_string()));
+            },
+        );
+    }
+
+    #[test]
+    fn test_kiro_env_beats_weak_posit_marker() {
+        // KIRO_SESSION_ID names the direct caller; the workspace-scoped
+        // PA_PROJECT_DIR must not win over it.
+        with_env_vars(
+            &[("PA_PROJECT_DIR", "/work"), ("KIRO_SESSION_ID", "s")],
+            || {
+                let result = detect_agent_with_details();
+                assert_eq!(result.agent, Agent::Kiro);
+            },
+        );
+    }
+
+    #[test]
+    fn test_kiro_identity_mappings() {
+        assert_eq!(Agent::Kiro.config_key(), "kiro");
+        assert!(Agent::Kiro.is_known());
+        assert_eq!(Agent::from_name("kiro"), Agent::Kiro);
+        assert_eq!(Agent::from_name("Kiro"), Agent::Kiro);
+        assert_eq!(Agent::from_name("kiro-cli"), Agent::Kiro);
+        assert_eq!(Agent::from_name("kiro_ide"), Agent::Kiro);
+        assert_eq!(format!("{}", Agent::Kiro), "Kiro");
     }
 
     #[test]

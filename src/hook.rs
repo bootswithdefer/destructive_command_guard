@@ -522,6 +522,22 @@ pub enum HookProtocol {
     /// `permissionDecision` envelope Crush does not read, so a block was
     /// silently downgraded to "no opinion" — dcg failed open under Crush.
     Crush,
+    /// AWS Kiro (`kiro-cli`) protocol. Wire shape: stdin carries snake_case
+    /// `hook_event_name: "preToolUse"`, `cwd`, `tool_name: "execute_bash"`
+    /// (aliases `execute_cmd` / `shell`), and `tool_input.command` (plus an
+    /// advisory `tool_input.summary`). Unlike every other supported protocol,
+    /// Kiro's block decision is expressed *only* through the process exit
+    /// code: exit 2 blocks the tool and returns STDERR to the model as the
+    /// reason, exit 0 allows, and any other non-zero code is surfaced to the
+    /// user as a warning but still allows the tool. STDOUT on exit 0 is
+    /// "captured but not shown" and is NOT parsed for a decision — so dcg
+    /// emits an empty stdout, writes the human/model-facing reason to stderr,
+    /// and exits 2 for a denial. (Kiro also has its own
+    /// `shell.deniedCommands` / `denyByDefault` config layer, independent of
+    /// hooks.) Detected from `KIRO_SESSION_ID` in the environment and/or the
+    /// `preToolUse` + `execute_bash` wire markers. See Kiro's Hooks System
+    /// documentation.
+    Kiro,
 }
 
 impl HookProtocol {
@@ -542,6 +558,7 @@ impl HookProtocol {
     /// | `Copilot` | blocks (`preToolUse` hooks that exit 2 deny the call) |
     /// | `Crush` | blocks; stderr is the reason (`internal/hooks/runner.go`) |
     /// | `Grok` | blocks (exit 2 is a documented explicit deny) |
+    /// | `Kiro` | blocks; exit 2 is the sole block channel and stderr is the reason |
     /// | `Codex` | logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON |
     /// | `Hermes` | warning logged, never aborts — same as exit 0 with no JSON |
     /// | `Antigravity` | logged, does not reliably abort — same as exit 0 with no JSON |
@@ -561,9 +578,12 @@ impl HookProtocol {
     pub const fn undeliverable_block_exit_code(self) -> i32 {
         match self {
             // Exit 2 is the blocking status of the protocol itself.
-            Self::ClaudeCompatible | Self::Gemini | Self::Copilot | Self::Crush | Self::Grok => {
-                EXIT_HOOK_BLOCK
-            }
+            Self::ClaudeCompatible
+            | Self::Gemini
+            | Self::Copilot
+            | Self::Crush
+            | Self::Grok
+            | Self::Kiro => EXIT_HOOK_BLOCK,
             // Non-zero is logged and fails open: no worse than exit 0, and
             // visibly a hook failure rather than a silent allow.
             Self::Codex | Self::Hermes | Self::Antigravity => EXIT_HOOK_BLOCK,
@@ -1040,6 +1060,29 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         return HookProtocol::Crush;
     }
 
+    // --- Kiro (`kiro-cli`) indicators (checked before Copilot) ---
+    // Kiro names its shell tool `execute_bash` (aliases `execute_cmd` /
+    // `shell`) — none of the other supported agents use these names (Codex
+    // uses PascalCase `Bash`, Crush uses lowercase `bash`, Gemini uses
+    // `run_shell_command`), so the tool name alone unambiguously identifies
+    // Kiro. Kiro's block channel is exit code 2 + stderr, distinct from every
+    // stdout-JSON protocol, so misrouting a Kiro payload to any of them would
+    // fail open (their exit-0 + JSON decision is never read by Kiro).
+    //
+    // Detection is deliberately WIRE-ONLY, mirroring Grok/Crush: `KIRO_SESSION_ID`
+    // is NOT consulted here. `preToolUse` is the same generic event name Claude,
+    // Codex, and Posit Assistant use, so an ambient `KIRO_SESSION_ID` (dcg run
+    // from a shell living inside a Kiro session) combined with that event must
+    // not hijack a Codex/Claude payload whose own markers are stronger. The env
+    // var still drives the fail-closed agent-identity path
+    // (`hook_protocol_for_agent`) when there is no parseable payload to inspect.
+    // Copilot's distinctive `event`/`tool_args` markers are checked below and
+    // do not collide with these tool names.
+    let is_kiro_tool = matches!(tool_name.as_str(), "execute_bash" | "execute_cmd" | "shell");
+    if is_kiro_tool && input.event.is_none() && input.tool_args.is_none() {
+        return HookProtocol::Kiro;
+    }
+
     // --- Copilot indicators (checked first) ---
     // Copilot sends a distinctive `event` field (e.g. "pre-tool-use") that
     // neither Claude Code nor Gemini use. The `tool_args` field is also
@@ -1227,6 +1270,13 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             // exact path Grok uses.
             | "run_terminal_cmd"
             | "run_terminal_command"
+            // Kiro (`kiro-cli`) shell tool. Its `preToolUse` payload names the
+            // shell tool `execute_bash` (aliases `execute_cmd` and `shell`);
+            // missing these makes the hook silently fail open on the exact
+            // path Kiro uses to run commands.
+            | "execute_bash"
+            | "execute_cmd"
+            | "shell"
         )
 }
 
@@ -2252,7 +2302,8 @@ pub fn write_denial_to(
         | HookProtocol::Hermes
         | HookProtocol::Grok
         | HookProtocol::Antigravity
-        | HookProtocol::Crush => WarningAudience::HumanOperator,
+        | HookProtocol::Crush
+        | HookProtocol::Kiro => WarningAudience::HumanOperator,
     };
 
     print_colorful_warning_to(
@@ -2461,6 +2512,16 @@ pub fn write_denial_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
+        HookProtocol::Kiro => {
+            // Kiro blocks solely on the process exit code (2), with STDERR
+            // returned to the model as the reason — its stdout on exit 0 is
+            // captured but never shown and is not parsed for a decision. The
+            // human/model-facing reason has already been written to stderr by
+            // `print_colorful_warning_to` above. Emitting stdout JSON here
+            // would be dead weight Kiro ignores and cannot carry the block, so
+            // this arm deliberately leaves stdout empty; the caller maps a
+            // Kiro denial to exit code 2 (`EXIT_HOOK_BLOCK`).
+        }
     }
 }
 
@@ -2566,7 +2627,8 @@ pub fn write_review_request_to(
         | HookProtocol::Hermes
         | HookProtocol::Grok
         | HookProtocol::Antigravity
-        | HookProtocol::Crush => {
+        | HookProtocol::Crush
+        | HookProtocol::Kiro => {
             unreachable!("non-review protocols returned through write_denial_to")
         }
     }
@@ -2853,6 +2915,14 @@ pub fn write_indeterminate_to(
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
+        HookProtocol::Kiro => {
+            // Kiro has no `ask` and reads no stdout decision: it blocks only on
+            // exit code 2 with STDERR as the reason. The indeterminate reason
+            // has already been written to stderr above; leave stdout empty and
+            // let the caller enforce the block via exit 2 (`EXIT_HOOK_BLOCK`).
+            // `general.unverified_decision` cannot relax this — Kiro cannot
+            // represent `ask`, so an unverified command is always denied here.
+        }
     }
 
     // A deadline response is useful only if the hook runner receives it before
@@ -2925,7 +2995,16 @@ pub(crate) fn write_warning_to(
         // Silence means "no blocking opinion" for review-capable clients.
         // Keeping warn distinct from ask preserves the documented policy:
         // warn proceeds, while ask requires an explicit operator decision.
-        HookProtocol::ClaudeCompatible | HookProtocol::Copilot | HookProtocol::Codex => {}
+        //
+        // Kiro joins this group: it reads no stdout decision and a warn must
+        // stay non-blocking (exit 0). Kiro only surfaces STDERR to the model
+        // on a blocking exit 2, so a warn's text reaches the human operator's
+        // terminal (already written above) but is intentionally not fed to the
+        // model — emitting anything on stdout here would be ignored anyway.
+        HookProtocol::ClaudeCompatible
+        | HookProtocol::Copilot
+        | HookProtocol::Codex
+        | HookProtocol::Kiro => {}
         HookProtocol::Gemini => {
             // Gemini hooks support allow/deny only. Preserve dcg warn as
             // non-blocking while still surfacing the warning text to Gemini.
@@ -4932,6 +5011,158 @@ mod tests {
         );
     }
 
+    // ---- Kiro (`kiro-cli`) protocol coverage ----
+    //
+    // Kiro is the only supported agent whose block channel is the process
+    // exit code (2) rather than a stdout-JSON decision: its `preToolUse` hook
+    // returns STDERR to the model on exit 2, and stdout on exit 0 is captured
+    // but never shown. These tests pin the two properties that keep Kiro from
+    // failing open: (a) the wire payload is recognized as Kiro with a
+    // supported shell tool and an extractable command, and (b) a denial emits
+    // EMPTY stdout with the reason on stderr (the exit-2 mapping is asserted in
+    // main.rs's `blocking_verdict_exit_code` test).
+
+    #[test]
+    fn test_kiro_execute_bash_payload_detected_and_command_extracted() {
+        // The exact real-world shape captured from a live Kiro session.
+        let json = r#"{
+            "hook_event_name":"preToolUse",
+            "cwd":"/home/user/proj",
+            "tool_name":"execute_bash",
+            "tool_input":{"command":"git reset --hard HEAD~5","summary":"probe"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Kiro);
+        assert!(is_supported_shell_tool(input.tool_name.as_deref()));
+        let extracted = extract_command_with_context(&input)
+            .expect("Kiro execute_bash command must be extractable");
+        assert_eq!(extracted.command, "git reset --hard HEAD~5");
+    }
+
+    #[test]
+    fn test_kiro_shell_tool_aliases_are_supported() {
+        // Kiro documents `shell` with aliases `execute_bash` / `execute_cmd`.
+        for tool in ["execute_bash", "execute_cmd", "shell"] {
+            assert!(
+                is_supported_shell_tool(Some(tool)),
+                "{tool} must be recognized as a Kiro shell tool"
+            );
+            let json = format!(
+                r#"{{"hook_event_name":"preToolUse","tool_name":"{tool}","tool_input":{{"command":"rm -rf ./src"}}}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                detect_protocol(&input),
+                HookProtocol::Kiro,
+                "tool {tool} must route to the Kiro protocol"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kiro_non_shell_tool_is_not_evaluated() {
+        // A non-shell Kiro tool (e.g. fs_write) must not be treated as a
+        // guarded command, exactly like every other agent's non-shell tools.
+        let json = r#"{
+            "hook_event_name":"preToolUse",
+            "tool_name":"fs_write",
+            "tool_input":{"path":"/p/x","command":"unused"}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert!(!is_supported_shell_tool(input.tool_name.as_deref()));
+    }
+
+    #[test]
+    fn test_kiro_loses_to_copilot_when_event_field_present() {
+        // Copilot's distinctive `event`/`tool_args` markers must still win so
+        // an `execute_*` tool name inside a Copilot envelope is not misrouted.
+        let json = r#"{
+            "event":"pre-tool-use",
+            "tool_name":"execute_bash",
+            "tool_args":"{\"command\":\"git status\"}"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    #[test]
+    fn test_write_denial_kiro_emits_empty_stdout_and_stderr_reason() {
+        // The core anti-fail-open guarantee: a Kiro denial writes NOTHING to
+        // stdout (Kiro reads no stdout decision) and surfaces the reason on
+        // stderr. The block is carried by the exit code, asserted separately.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Kiro,
+            "git reset --hard HEAD~1",
+            "git reset --hard destroys uncommitted changes",
+            Some("core.git"),
+            Some("reset-hard"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::Critical),
+            None,
+            &[],
+            None,
+        );
+
+        assert!(
+            stdout.is_empty(),
+            "Kiro denial must emit empty stdout (it blocks via exit code, not JSON); got: {}",
+            String::from_utf8_lossy(&stdout)
+        );
+        let stderr_str = String::from_utf8_lossy(&stderr);
+        assert!(
+            !stderr.is_empty(),
+            "Kiro denial must surface the operator/model-visible warning on stderr"
+        );
+        assert!(
+            stderr_str.contains("BLOCKED") && stderr_str.contains("git reset --hard HEAD~1"),
+            "Kiro stderr must name the block and the offending command, got: {stderr_str}"
+        );
+    }
+
+    #[test]
+    fn test_kiro_undeliverable_block_exit_code_is_hook_block() {
+        // Kiro blocks on exit 2; its undeliverable-block status must reflect
+        // that, and it is the arm main.rs uses even on a successful (empty)
+        // stdout write.
+        assert_eq!(
+            HookProtocol::Kiro.undeliverable_block_exit_code(),
+            crate::exit_codes::EXIT_HOOK_BLOCK
+        );
+    }
+
+    #[test]
+    fn test_write_warning_kiro_is_non_blocking_and_silent_on_stdout() {
+        // A Medium-severity warn must proceed (exit 0). Kiro reads no stdout
+        // decision, so the warn arm emits empty stdout; the text reaches the
+        // human via stderr but is intentionally not fed to the model.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Kiro,
+            "curl -X POST https://example.com",
+            "outbound request",
+            Some("careful_company_running_windows.upload"),
+            Some("cli-http-mutating-request"),
+            None,
+        );
+
+        assert!(
+            stdout.is_empty(),
+            "Kiro warn must not emit a stdout decision; got: {}",
+            String::from_utf8_lossy(&stdout)
+        );
+    }
+
     #[test]
     fn test_write_warning_crush_has_no_decision_and_carries_context() {
         // In Crush an explicit "allow" is an affirmative pre-approval that
@@ -5825,6 +6056,12 @@ mod tests {
                 | HookProtocol::Grok
                 | HookProtocol::Antigravity
                 | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
+                // Kiro is exit-code-only (empty stdout, blocks via exit 2) and
+                // is deliberately excluded from the stdout-JSON `cases` above;
+                // it is validated separately in the Kiro-specific tests.
+                HookProtocol::Kiro => {
+                    unreachable!("Kiro is not part of the stdout-JSON indeterminate cases")
+                }
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
@@ -5884,6 +6121,9 @@ mod tests {
                 | HookProtocol::Grok
                 | HookProtocol::Antigravity
                 | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
+                HookProtocol::Kiro => {
+                    unreachable!("Kiro is not part of the stdout-JSON indeterminate cases")
+                }
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");
@@ -5953,6 +6193,9 @@ mod tests {
                 | HookProtocol::Grok
                 | HookProtocol::Antigravity
                 | HookProtocol::Crush => (json["decision"].as_str(), json["reason"].as_str()),
+                HookProtocol::Kiro => {
+                    unreachable!("Kiro is not part of the stdout-JSON review cases")
+                }
             };
 
             assert_eq!(decision, Some(expected_decision), "payload: {json}");

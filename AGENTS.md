@@ -548,6 +548,20 @@ Codex CLI uses a stricter hook parser: blocked commands return a minimal
 [`docs/codex-integration.md`](docs/codex-integration.md) for the Codex-specific
 protocol notes.
 
+Kiro (`kiro-cli`) is the one supported agent that blocks on the **process exit
+code rather than a stdout decision**: its `preToolUse` hook treats exit 2 as a
+block (STDERR is returned to the model as the reason), exit 0 as allow, and
+stdout on exit 0 is captured but never shown. dcg detects Kiro from its shell
+tool names (`execute_bash` / `execute_cmd` / `shell`, unique among supported
+agents) and the `KIRO_SESSION_ID` env var, and answers a denial with empty
+stdout + exit 2. `blocking_verdict_exit_code` in `src/main.rs` forces exit 2 for
+the Kiro protocol regardless of stdout delivery, so `HookProtocol::Kiro`
+denials/reviews/indeterminates all fail closed. Protocol detection is
+wire-only (tool name), NOT env-based: `preToolUse` is the same generic event
+name Claude/Codex/Posit use, so an ambient `KIRO_SESSION_ID` must never hijack
+another agent's payload — the env var only drives the no-payload fail-closed
+identity path.
+
 ---
 
 ## Error Codes Reference
