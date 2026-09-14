@@ -324,7 +324,7 @@ pub enum Command {
         /// (when combined with `--project`). Grok also picks up dcg from
         /// `~/.claude/settings.json` via its Claude-Code compatibility layer,
         /// but the native path gives the cleanest doctor output.
-        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush"])]
+        #[arg(long, conflicts_with_all = ["agy", "opencode", "omp", "crush", "kiro"])]
         grok: bool,
 
         /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
@@ -332,7 +332,7 @@ pub enum Command {
         /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
         /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
         /// its `run_command` shell tool when dcg returns a block decision.
-        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush"])]
+        #[arg(long, conflicts_with_all = ["grok", "opencode", "omp", "crush", "kiro"])]
         agy: bool,
 
         /// Install a native OpenCode plugin at
@@ -342,7 +342,7 @@ pub enum Command {
         /// `tool.execute.before` hook: every bash tool call is routed through
         /// dcg's Claude-compatible hook protocol, and a deny aborts the tool
         /// call with dcg's reason. Restart OpenCode after installing (#318).
-        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "omp", "crush", "kiro"])]
         opencode: bool,
 
         /// Install a native Oh My Pi (`omp`) `tool_call` extension at the
@@ -351,7 +351,7 @@ pub enum Command {
         /// `<cwd>/.omp/extensions/dcg-guard.ts` (with `--project`). OMP's
         /// extension discovery is cwd-only and does not walk Git ancestors.
         /// Every OMP bash tool call is routed through dcg before execution.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "crush", "kiro"])]
         omp: bool,
 
         /// Install the dcg PreToolUse hook for Charm Crush by merging a
@@ -360,8 +360,27 @@ pub enum Command {
         /// and `CRUSH_GLOBAL_CONFIG`) or the repo's `crush.json` (with
         /// `--project`). Crush pipes every bash tool call to dcg's stdin and
         /// blocks the call when dcg answers `{"decision":"deny"}`.
-        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp"])]
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "kiro"])]
         crush: bool,
+
+        /// Install the dcg `preToolUse` hook into a Kiro (`kiro-cli`) agent
+        /// config at `~/.kiro/agents/<name>.json`. Requires `--agent <name>`
+        /// naming an existing user/global agent (built-in agents
+        /// `kiro_default`/`kiro_guide`/`kiro_planner` cannot be edited and are
+        /// rejected). A marker-owned `{ "name": "dcg-guard", "matcher":
+        /// "shell", "command": "<abs dcg path>" }` entry is merged into
+        /// `hooks.preToolUse`, preserving every other field and hook. Kiro
+        /// hot-reloads agent configs, so the guard applies without restarting
+        /// an active session.
+        #[arg(long, conflicts_with_all = ["grok", "agy", "opencode", "omp", "crush"])]
+        kiro: bool,
+
+        /// Name of the Kiro user/global agent to install the hook into (the
+        /// `<name>` in `~/.kiro/agents/<name>.json`). Only meaningful with
+        /// `--kiro`. When omitted, `dcg install --kiro` lists the available
+        /// user agents and exits without modifying anything.
+        #[arg(long, requires = "kiro")]
+        agent: Option<String>,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -384,7 +403,8 @@ pub enum Command {
         no_shell_check: bool,
     },
 
-    /// Remove the hook from Claude Code settings (or from Crush with `--crush`)
+    /// Remove the hook from Claude Code settings (or from Crush with
+    /// `--crush`, or a Kiro agent with `--kiro --agent <name>`)
     #[command(name = "uninstall")]
     Uninstall {
         /// Also remove configuration files
@@ -395,6 +415,17 @@ pub enum Command {
         /// of Claude Code settings
         #[arg(long, conflicts_with = "purge")]
         crush: bool,
+
+        /// Remove the dcg `preToolUse` hook from a Kiro agent config
+        /// (`~/.kiro/agents/<name>.json`). Requires `--agent <name>`. Only the
+        /// marker-owned dcg entry is removed; other hooks are preserved.
+        #[arg(long, conflicts_with_all = ["purge", "crush"])]
+        kiro: bool,
+
+        /// Name of the Kiro user/global agent to remove the hook from. Only
+        /// meaningful with `--kiro`.
+        #[arg(long, requires = "kiro")]
+        agent: Option<String>,
     },
 
     /// Update dcg to the latest release (re-runs the installer)
@@ -2418,6 +2449,8 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             opencode,
             omp,
             crush,
+            kiro,
+            agent,
         }) => {
             if grok {
                 install_grok_hook(force, project)?;
@@ -2429,6 +2462,8 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 install_omp_extension(force, project, true)?;
             } else if crush {
                 install_crush_hook(force, project)?;
+            } else if kiro {
+                install_kiro_hook(force, agent.as_deref())?;
             } else {
                 install_hook(force, project)?;
             }
@@ -2440,9 +2475,16 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }) => {
             run_setup(force, shell_check, no_shell_check)?;
         }
-        Some(Command::Uninstall { purge, crush }) => {
+        Some(Command::Uninstall {
+            purge,
+            crush,
+            kiro,
+            agent,
+        }) => {
             if crush {
                 uninstall_crush_hook()?;
+            } else if kiro {
+                uninstall_kiro_hook(agent.as_deref())?;
             } else {
                 uninstall_hook(purge)?;
             }
@@ -13397,6 +13439,315 @@ fn project_antigravity_hooks_path() -> Result<std::path::PathBuf, Box<dyn std::e
     Ok(repo_root.join(".gemini").join("config").join("hooks.json"))
 }
 
+// ---- Kiro (`kiro-cli`) install support ----
+//
+// Kiro runs a hook before its shell tool (`execute_bash`, aliases
+// `execute_cmd` / `shell`) and blocks the tool on hook exit code 2. Unlike
+// every other supported agent, Kiro has NO single global hook file: hooks live
+// inside each agent config at `~/.kiro/agents/<name>.json`, and only the agent
+// a session actually runs is guarded. The built-in agents (`kiro_default`,
+// `kiro_guide`, `kiro_planner`) have no editable config file and cannot carry a
+// hook, so `dcg install --kiro` requires an explicit `--agent <name>` naming a
+// user/global agent.
+//
+// dcg owns its entry by a stable `name: "dcg-guard"` marker (Kiro's array hook
+// format supports a per-entry name; the object format does not, so dcg always
+// writes the array shape it can mark and re-own idempotently). The entry
+// targets the `shell` tool matcher and invokes the absolute dcg binary path.
+
+/// Kiro's `preToolUse` hook trigger key (object-format hooks map).
+const KIRO_PRE_TOOL_USE_EVENT: &str = "preToolUse";
+
+/// Marker name identifying dcg's own Kiro hook entry, so uninstall removes only
+/// dcg's entry and reinstall re-owns it rather than duplicating.
+const KIRO_DCG_HOOK_NAME: &str = "dcg-guard";
+
+/// Kiro shell-tool matcher. `shell` is the canonical tool name (aliases
+/// `execute_bash` / `execute_cmd`); the matcher resolves the alias.
+const KIRO_SHELL_MATCHER: &str = "shell";
+
+/// Built-in Kiro agents that have no editable config file on disk and thus
+/// cannot carry a `preToolUse` hook (per Kiro's `/agent edit` docs).
+const KIRO_BUILTIN_AGENTS: &[&str] = &["kiro_default", "kiro_guide", "kiro_planner"];
+
+/// The user-level Kiro agents directory: `~/.kiro/agents`.
+fn kiro_agents_dir() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".kiro")
+        .join("agents")
+}
+
+/// Path to a user/global Kiro agent config: `~/.kiro/agents/<name>.json`.
+fn kiro_agent_config_path(agent: &str) -> std::path::PathBuf {
+    kiro_agents_dir().join(format!("{agent}.json"))
+}
+
+/// Whether `agent` names a built-in Kiro agent (case-insensitive).
+fn is_kiro_builtin_agent(agent: &str) -> bool {
+    KIRO_BUILTIN_AGENTS
+        .iter()
+        .any(|builtin| builtin.eq_ignore_ascii_case(agent))
+}
+
+/// List the user/global agent names discovered under `~/.kiro/agents/*.json`.
+fn list_kiro_user_agents() -> Vec<String> {
+    let dir = kiro_agents_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The dcg-owned Kiro hook entry: `{ "name": "dcg-guard", "matcher": "shell",
+/// "command": "<abs dcg path>" }`.
+fn kiro_dcg_hook_entry() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let executable = current_dcg_executable()?;
+    let command = executable.to_string_lossy().into_owned();
+    Ok(serde_json::json!({
+        "name": KIRO_DCG_HOOK_NAME,
+        "matcher": KIRO_SHELL_MATCHER,
+        "command": command,
+    }))
+}
+
+/// Whether a `preToolUse` hook entry is dcg-owned (carries the `dcg-guard`
+/// marker name). Works for both object- and array-format entries.
+fn is_kiro_dcg_hook_entry(entry: &serde_json::Value) -> bool {
+    entry
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| name == KIRO_DCG_HOOK_NAME)
+}
+
+/// Remove dcg-owned entries from a Kiro `preToolUse` hook array, returning the
+/// number removed. `hooks_pre` must be a JSON array.
+fn remove_dcg_entries_from_kiro_pre_tool_use(hooks_pre: &mut Vec<serde_json::Value>) -> usize {
+    let before = hooks_pre.len();
+    hooks_pre.retain(|entry| !is_kiro_dcg_hook_entry(entry));
+    before - hooks_pre.len()
+}
+
+/// Merge dcg's `preToolUse` entry into an in-memory Kiro agent config,
+/// preserving every other field and hook. Returns `Ok(true)` when the config
+/// changed (or `force` is set).
+///
+/// The agent config's `hooks` field may be absent, an object keyed by trigger
+/// (`{"preToolUse": [ ... ]}`), or an array of hook documents. dcg writes into
+/// the object form's `preToolUse` array — the documented default — creating
+/// the structure when absent. An existing dcg entry (by marker name) is
+/// replaced so the command path refreshes; other entries are preserved.
+fn install_kiro_hook_into_config(
+    config: &mut serde_json::Value,
+    force: bool,
+    desired_entry: serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let config_obj = config
+        .as_object_mut()
+        .ok_or("Invalid Kiro agent config (expected a JSON object)")?;
+    let original = serde_json::Value::Object(config_obj.clone());
+
+    let hooks = config_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+
+    // Kiro accepts both an object-keyed hooks map and a flat array of hook
+    // documents. dcg only writes/owns the object form's `preToolUse` array; if
+    // the host uses the array form, converting it would rewrite host-owned
+    // structure, so refuse rather than risk clobbering it.
+    let hooks_obj = hooks.as_object_mut().ok_or(
+        "Kiro agent config uses the array hooks format; dcg install --kiro supports the object \
+         format ({\"hooks\": {\"preToolUse\": [...]}}). Convert the hooks field or add the dcg \
+         entry manually.",
+    )?;
+
+    let pre = hooks_obj
+        .entry(KIRO_PRE_TOOL_USE_EVENT)
+        .or_insert_with(|| serde_json::json!([]));
+    let entries = pre
+        .as_array_mut()
+        .ok_or("Invalid hooks.preToolUse in Kiro agent config (expected a JSON array)")?;
+
+    remove_dcg_entries_from_kiro_pre_tool_use(entries);
+    entries.insert(0, desired_entry);
+
+    let changed = force || serde_json::Value::Object(config_obj.clone()) != original;
+    Ok(changed)
+}
+
+/// Remove dcg's entry from an in-memory Kiro agent config. Returns `true`
+/// when at least one dcg entry was removed. Never fails: an unrecognized
+/// `hooks` shape simply contains no dcg entry to remove.
+fn uninstall_dcg_hook_from_kiro_config(config: &mut serde_json::Value) -> bool {
+    let Some(hooks) = config.get_mut("hooks") else {
+        return false;
+    };
+    // Object form: hooks.preToolUse is an array of entries.
+    if let Some(pre) = hooks.get_mut(KIRO_PRE_TOOL_USE_EVENT) {
+        if let Some(entries) = pre.as_array_mut() {
+            return remove_dcg_entries_from_kiro_pre_tool_use(entries) > 0;
+        }
+    }
+    // Array form: a flat list of hook documents; remove dcg-marked ones.
+    if let Some(entries) = hooks.as_array_mut() {
+        return remove_dcg_entries_from_kiro_pre_tool_use(entries) > 0;
+    }
+    false
+}
+
+/// Read a Kiro agent config file, treating empty as an empty object.
+fn read_kiro_agent_config(
+    path: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    Ok(serde_json::from_str(&content)?)
+}
+
+/// Merge dcg's `preToolUse` hook into the Kiro agent config at `path` without
+/// printing (shared by `dcg install --kiro` and its tests). Returns `Ok(true)`
+/// when the file was (re)written.
+fn install_kiro_hook_at(
+    path: &std::path::Path,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut config = read_kiro_agent_config(path)?;
+    let changed = install_kiro_hook_into_config(&mut config, force, kiro_dcg_hook_entry()?)?;
+    if changed {
+        let content = serde_json::to_string_pretty(&config)?;
+        std::fs::write(path, content)?;
+    }
+    Ok(changed)
+}
+
+/// Install the dcg `preToolUse` hook into a named Kiro user/global agent.
+///
+/// `--agent <name>` is required: Kiro has no global hook file, so the caller
+/// must choose which agent to guard. Built-in agents are rejected (no editable
+/// config). A missing agent file is an error suggesting `kiro-cli agent
+/// create`, rather than inventing config.
+fn install_kiro_hook(force: bool, agent: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let Some(agent) = agent else {
+        // No --agent: list available user agents and exit without modifying
+        // anything, as designed.
+        eprintln!(
+            "{}",
+            "dcg install --kiro requires --agent <name>."
+                .yellow()
+                .bold()
+        );
+        eprintln!(
+            "Kiro stores hooks per agent (~/.kiro/agents/<name>.json); there is no global hook \
+             file, so choose which agent to guard."
+        );
+        let agents = list_kiro_user_agents();
+        if agents.is_empty() {
+            eprintln!();
+            eprintln!(
+                "No user agents found in {}. Create one first with:",
+                kiro_agents_dir().display()
+            );
+            eprintln!("  kiro-cli agent create <name>");
+        } else {
+            eprintln!();
+            eprintln!("Available user agents:");
+            for name in &agents {
+                eprintln!("  {name}");
+            }
+            eprintln!();
+            eprintln!("Then run: dcg install --kiro --agent <name>");
+        }
+        return Err("no --agent specified".into());
+    };
+
+    if is_kiro_builtin_agent(agent) {
+        return Err(format!(
+            "Cannot install into built-in agent '{agent}': built-in agents \
+             (kiro_default/kiro_guide/kiro_planner) have no editable config file. \
+             Create a new agent with 'kiro-cli agent create <name>' and target that."
+        )
+        .into());
+    }
+
+    let config_path = kiro_agent_config_path(agent);
+    if !config_path.exists() {
+        return Err(format!(
+            "Kiro agent '{agent}' not found at {}. Create it first with \
+             'kiro-cli agent create {agent}'.",
+            config_path.display()
+        )
+        .into());
+    }
+
+    if !install_kiro_hook_at(&config_path, force)? {
+        println!("{}", "Hook already installed!".yellow());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+
+    println!("{}", "Kiro hook installed successfully!".green().bold());
+    println!("Agent config updated: {}", config_path.display());
+    println!();
+    println!(
+        "{}",
+        "Kiro hot-reloads agent configs, so the guard applies to a running session once the \
+         file is saved (or on the next `kiro-cli chat --agent` launch)."
+            .yellow()
+    );
+
+    Ok(())
+}
+
+/// Remove the dcg `preToolUse` hook from a named Kiro user/global agent.
+fn uninstall_kiro_hook(agent: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let Some(agent) = agent else {
+        return Err("dcg uninstall --kiro requires --agent <name>.".into());
+    };
+
+    let config_path = kiro_agent_config_path(agent);
+    if !config_path.exists() {
+        println!(
+            "{} {}",
+            "No Kiro agent config found at".yellow(),
+            config_path.display()
+        );
+        return Ok(());
+    }
+
+    let mut config = read_kiro_agent_config(&config_path)?;
+    let removed = uninstall_dcg_hook_from_kiro_config(&mut config);
+    if removed {
+        let content = serde_json::to_string_pretty(&config)?;
+        std::fs::write(&config_path, content)?;
+        println!("{}", "Kiro hook removed successfully!".green().bold());
+        println!("Agent config updated: {}", config_path.display());
+    } else {
+        println!("{} {}", "No dcg hook found in Kiro agent".yellow(), agent);
+    }
+
+    Ok(())
+}
+
 /// Regex Crush tests against the tool name; its shell tool is `bash` on
 /// every platform (Crush runs an embedded POSIX shell, so there is no
 /// PowerShell variant to match).
@@ -20770,6 +21121,189 @@ mod tests {
         assert!(uninstall_dcg_hook_from_crush_config(&mut config).is_err());
     }
 
+    // ---- Kiro install tests ----
+
+    fn kiro_entry_for(path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": KIRO_DCG_HOOK_NAME,
+            "matcher": KIRO_SHELL_MATCHER,
+            "command": path,
+        })
+    }
+
+    fn kiro_pre_tool_use(config: &serde_json::Value) -> &Vec<serde_json::Value> {
+        config["hooks"][KIRO_PRE_TOOL_USE_EVENT]
+            .as_array()
+            .expect("preToolUse array")
+    }
+
+    #[test]
+    fn install_kiro_creates_hooks_structure_and_preserves_fields() {
+        let mut config = serde_json::json!({
+            "name": "my-agent",
+            "tools": ["shell"],
+            "prompt": "be careful"
+        });
+        let changed = install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/opt/dcg"))
+            .expect("install ok");
+        assert!(changed);
+        // Host fields preserved.
+        assert_eq!(config["name"], "my-agent");
+        assert_eq!(config["tools"], serde_json::json!(["shell"]));
+        assert_eq!(config["prompt"], "be careful");
+        // dcg entry created under hooks.preToolUse.
+        let entries = kiro_pre_tool_use(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], kiro_entry_for("/opt/dcg"));
+    }
+
+    #[test]
+    fn install_kiro_is_idempotent_without_force() {
+        let mut config = serde_json::json!({
+            "hooks": { "preToolUse": [ kiro_entry_for("/opt/dcg") ] }
+        });
+        let changed = install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/opt/dcg"))
+            .expect("install ok");
+        assert!(!changed, "identical entry must be a no-op");
+        assert_eq!(kiro_pre_tool_use(&config).len(), 1);
+
+        let changed = install_kiro_hook_into_config(&mut config, true, kiro_entry_for("/opt/dcg"))
+            .expect("install ok");
+        assert!(changed, "--force always reports a rewrite");
+        assert_eq!(kiro_pre_tool_use(&config).len(), 1);
+    }
+
+    #[test]
+    fn install_kiro_replaces_stale_dcg_entry_and_keeps_other_hooks() {
+        let mut config = serde_json::json!({
+            "hooks": {
+                "preToolUse": [
+                    { "name": "dcg-guard", "matcher": "shell", "command": "/old/dcg" },
+                    { "matcher": "write", "command": "./hooks/validate-write.sh" }
+                ],
+                "postToolUse": [
+                    { "matcher": "shell", "command": "./hooks/audit.sh" }
+                ]
+            }
+        });
+        let changed = install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/new/dcg"))
+            .expect("install ok");
+        assert!(changed);
+
+        let entries = kiro_pre_tool_use(&config);
+        assert_eq!(
+            entries.len(),
+            2,
+            "refreshed dcg entry first, user hook kept"
+        );
+        assert_eq!(entries[0]["command"], "/new/dcg");
+        assert_eq!(entries[0]["name"], "dcg-guard");
+        assert_eq!(entries[1]["command"], "./hooks/validate-write.sh");
+        // Unrelated trigger untouched.
+        assert_eq!(
+            config["hooks"]["postToolUse"][0]["command"],
+            "./hooks/audit.sh"
+        );
+    }
+
+    #[test]
+    fn install_kiro_rejects_array_hooks_format_and_bad_shapes() {
+        // Array-format hooks: dcg refuses rather than rewriting host structure.
+        let mut config = serde_json::json!({
+            "hooks": [ { "name": "x", "trigger": "agentSpawn", "action": { "type": "command", "command": "git status" } } ]
+        });
+        assert!(
+            install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/opt/dcg")).is_err()
+        );
+        // Top-level not an object.
+        let mut config = serde_json::json!([]);
+        assert!(
+            install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/opt/dcg")).is_err()
+        );
+        // preToolUse present but not an array.
+        let mut config = serde_json::json!({ "hooks": { "preToolUse": {} } });
+        assert!(
+            install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/opt/dcg")).is_err()
+        );
+    }
+
+    #[test]
+    fn uninstall_kiro_removes_only_dcg_entries() {
+        let mut config = serde_json::json!({
+            "name": "my-agent",
+            "hooks": {
+                "preToolUse": [
+                    kiro_entry_for("/opt/dcg"),
+                    { "matcher": "write", "command": "./hooks/validate-write.sh" }
+                ]
+            }
+        });
+        assert!(uninstall_dcg_hook_from_kiro_config(&mut config));
+        let entries = kiro_pre_tool_use(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], "./hooks/validate-write.sh");
+        assert_eq!(config["name"], "my-agent", "host field preserved");
+
+        assert!(
+            !uninstall_dcg_hook_from_kiro_config(&mut config),
+            "second pass finds nothing"
+        );
+
+        // No hooks key at all.
+        let mut config = serde_json::json!({ "name": "bare" });
+        assert!(!uninstall_dcg_hook_from_kiro_config(&mut config));
+    }
+
+    #[test]
+    fn uninstall_kiro_handles_array_hooks_format() {
+        let mut config = serde_json::json!({
+            "hooks": [
+                { "name": "dcg-guard", "trigger": "preToolUse", "matcher": "shell", "action": { "type": "command", "command": "/opt/dcg" } },
+                { "name": "keep", "trigger": "agentSpawn", "action": { "type": "command", "command": "git status" } }
+            ]
+        });
+        assert!(uninstall_dcg_hook_from_kiro_config(&mut config));
+        let entries = config["hooks"].as_array().expect("array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "keep");
+    }
+
+    #[test]
+    fn kiro_builtin_agents_are_rejected() {
+        assert!(is_kiro_builtin_agent("kiro_default"));
+        assert!(is_kiro_builtin_agent("KIRO_GUIDE"));
+        assert!(is_kiro_builtin_agent("kiro_planner"));
+        assert!(!is_kiro_builtin_agent("my-agent"));
+        // The install entrypoint refuses a built-in agent.
+        assert!(install_kiro_hook(false, Some("kiro_default")).is_err());
+    }
+
+    #[test]
+    fn kiro_agent_config_path_is_user_scoped() {
+        let path = kiro_agent_config_path("rust-dev");
+        assert!(path.ends_with(".kiro/agents/rust-dev.json"));
+    }
+
+    #[test]
+    fn kiro_install_at_roundtrips_via_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.json");
+        std::fs::write(&path, r#"{"name":"agent","tools":["shell"]}"#).unwrap();
+        // First install writes the entry.
+        assert!(install_kiro_hook_at(&path, false).expect("install"));
+        let config = read_kiro_agent_config(&path).expect("read");
+        let entries = kiro_pre_tool_use(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], KIRO_DCG_HOOK_NAME);
+        assert_eq!(entries[0]["matcher"], KIRO_SHELL_MATCHER);
+        // Second identical install is a no-op.
+        assert!(!install_kiro_hook_at(&path, false).expect("reinstall"));
+        // Uninstall removes it.
+        let mut config = read_kiro_agent_config(&path).expect("read");
+        assert!(uninstall_dcg_hook_from_kiro_config(&mut config));
+        assert_eq!(kiro_pre_tool_use(&config).len(), 0);
+    }
+
     #[test]
     fn crush_user_config_path_follows_crush_precedence() {
         use std::ffi::OsString;
@@ -21733,6 +22267,8 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            kiro: _,
+            agent: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21758,6 +22294,8 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            kiro: _,
+            agent: _,
         }) = cli.command
         {
             assert!(force);
@@ -21783,6 +22321,8 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            kiro: _,
+            agent: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21808,6 +22348,8 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            kiro: _,
+            agent: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21833,6 +22375,8 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            kiro: _,
+            agent: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21858,6 +22402,8 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            kiro: _,
+            agent: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21883,6 +22429,8 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            kiro: _,
+            agent: _,
         }) = cli.command
         {
             assert!(!force);
@@ -21908,6 +22456,8 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            kiro: _,
+            agent: _,
         }) = cli.command
         {
             assert!(force);
@@ -21933,6 +22483,8 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            kiro: _,
+            agent: _,
         }) = cli.command
         {
             assert!(force);
@@ -21958,6 +22510,8 @@ if ($errors.Count -ne 0) {
             opencode,
             omp,
             crush,
+            kiro: _,
+            agent: _,
         }) = cli.command
         {
             assert!(force);
@@ -21973,9 +22527,50 @@ if ($errors.Count -ne 0) {
     }
 
     #[test]
+    fn test_cli_parse_install_kiro_with_agent() {
+        let cli = Cli::parse_from(["dcg", "install", "--kiro", "--agent", "rust-dev"]);
+        if let Some(Command::Install {
+            kiro,
+            agent,
+            crush,
+            grok,
+            ..
+        }) = cli.command
+        {
+            assert!(kiro);
+            assert_eq!(agent.as_deref(), Some("rust-dev"));
+            assert!(!crush);
+            assert!(!grok);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_install_kiro_agent_requires_kiro() {
+        // --agent without --kiro is rejected (clap `requires`).
+        assert!(Cli::try_parse_from(["dcg", "install", "--agent", "rust-dev"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_parse_uninstall_kiro_with_agent() {
+        let cli = Cli::parse_from(["dcg", "uninstall", "--kiro", "--agent", "rust-dev"]);
+        if let Some(Command::Uninstall {
+            kiro, agent, crush, ..
+        }) = cli.command
+        {
+            assert!(kiro);
+            assert_eq!(agent.as_deref(), Some("rust-dev"));
+            assert!(!crush);
+        } else {
+            unreachable!("Expected Uninstall command");
+        }
+    }
+
+    #[test]
     fn test_cli_parse_uninstall_crush_excludes_purge() {
         let cli = Cli::parse_from(["dcg", "uninstall", "--crush"]);
-        if let Some(Command::Uninstall { purge, crush }) = cli.command {
+        if let Some(Command::Uninstall { purge, crush, .. }) = cli.command {
             assert!(!purge);
             assert!(crush);
         } else {
@@ -21999,6 +22594,11 @@ if ($errors.Count -ne 0) {
             ("--crush", "--agy"),
             ("--crush", "--opencode"),
             ("--crush", "--omp"),
+            ("--kiro", "--grok"),
+            ("--kiro", "--agy"),
+            ("--kiro", "--opencode"),
+            ("--kiro", "--omp"),
+            ("--kiro", "--crush"),
         ] {
             assert!(
                 Cli::try_parse_from(["dcg", "install", left, right]).is_err(),

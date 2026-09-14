@@ -241,6 +241,7 @@ POSIT_ASSISTANT_VERSION=""
 OPENCODE_VERSION=""
 CRUSH_VERSION=""
 OMP_VERSION=""
+KIRO_VERSION=""
 
 print_agent_scan_notice() {
   [ "$QUIET" -eq 1 ] && return 0
@@ -485,6 +486,15 @@ detect_agents() {
     DETECTED_AGENTS+=("omp")
     OMP_VERSION=$(try_version "$omp_bin")
   fi
+
+  # Kiro (`kiro-cli`) — agent configs live under ~/.kiro/agents/, optional
+  # `kiro-cli` CLI on PATH. dcg cannot auto-configure Kiro: hooks are per-agent
+  # (~/.kiro/agents/<name>.json) with no global hook file, so the operator must
+  # choose which agent to guard via `dcg install --kiro --agent <name>`.
+  if [[ -d "$HOME/.kiro" ]] || command -v kiro-cli &>/dev/null; then
+    DETECTED_AGENTS+=("kiro")
+    KIRO_VERSION=$(try_version kiro-cli)
+  fi
 }
 
 print_detected_agents() {
@@ -562,6 +572,11 @@ print_detected_agents() {
           [[ -n "$OMP_VERSION" ]] && ver_info=" (${OMP_VERSION})"
           gum style --foreground 42 "  ✓ Oh My Pi (omp)${ver_info}"
           ;;
+        kiro)
+          local ver_info=""
+          [[ -n "$KIRO_VERSION" ]] && ver_info=" (${KIRO_VERSION})"
+          gum style --foreground 42 "  ✓ Kiro${ver_info}"
+          ;;
       esac
     done
     echo ""
@@ -629,6 +644,11 @@ print_detected_agents() {
           local ver_info=""
           [[ -n "$OMP_VERSION" ]] && ver_info=" (${OMP_VERSION})"
           echo -e "  \033[0;32m✓\033[0m Oh My Pi (omp)${ver_info}"
+          ;;
+        kiro)
+          local ver_info=""
+          [[ -n "$KIRO_VERSION" ]] && ver_info=" (${KIRO_VERSION})"
+          echo -e "  \033[0;32m✓\033[0m Kiro${ver_info}"
           ;;
       esac
     done
@@ -1873,6 +1893,7 @@ CRUSH_STATUS=""  # "created"|"merged"|"skipped"|"failed"
 CRUSH_FAILURE_REASON=""
 OMP_STATUS=""  # "created"|"merged"|"skipped"|"failed"|"conflict"
 OMP_FAILURE_REASON=""
+KIRO_STATUS=""  # "guidance"|"skipped"
 POSIT_ASSISTANT_BACKUP=""
 CLAUDE_BACKUP=""
 GEMINI_BACKUP=""
@@ -2580,6 +2601,40 @@ configure_continue() {
 
   # Continue is installed but has no shell command hooks
   CONTINUE_STATUS="unsupported"
+}
+
+configure_kiro_guidance() {
+  # Kiro (`kiro-cli`) has native `preToolUse` hooks, but unlike every other
+  # supported agent the hook lives INSIDE a per-agent config
+  # (~/.kiro/agents/<name>.json) — there is no global hook file, and the
+  # built-in agents (kiro_default/kiro_guide/kiro_planner) cannot be edited.
+  # The installer therefore cannot guess which agent to guard, so it prints
+  # guidance instead of auto-configuring. The operator runs, per agent:
+  #   dcg install --kiro --agent <name>
+  local kiro_installed=0
+  if [ -d "$HOME/.kiro" ] || command -v kiro-cli >/dev/null 2>&1; then
+    kiro_installed=1
+  fi
+  if [ "$kiro_installed" -eq 0 ]; then
+    KIRO_STATUS="skipped"
+    return 0
+  fi
+
+  KIRO_STATUS="guidance"
+  [ "$QUIET" -eq 1 ] && return 0
+
+  echo ""
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    gum style --foreground 39 --bold "Kiro detected"
+    gum style --foreground 247 "Kiro stores hooks per agent (~/.kiro/agents/<name>.json); there is no global hook file."
+    gum style --foreground 247 "Guard a specific agent (built-in agents cannot be edited):"
+    gum style --foreground 42 "  dcg install --kiro --agent <name>"
+  else
+    echo -e "\033[1;36mKiro detected\033[0m"
+    echo "Kiro stores hooks per agent (~/.kiro/agents/<name>.json); there is no global hook file."
+    echo "Guard a specific agent (built-in agents cannot be edited):"
+    echo -e "  \033[0;32mdcg install --kiro --agent <name>\033[0m"
+  fi
 }
 
 configure_codex() {
@@ -4221,6 +4276,9 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
   # A refusal/failure is a terminal OMP_STATUS state rendered in the summary;
   # do not let `set -e` erase that truthful result or abort other install work.
   configure_omp || true
+
+  # Kiro (if installed): print per-agent guidance, no auto-configure.
+  configure_kiro_guidance || true
 else
   info "Skipping agent configuration (--no-configure)"
 fi
@@ -4535,6 +4593,15 @@ case "$OMP_STATUS" in
     else
       summary_lines+=("Oh My Pi:    Configuration failed")
     fi
+    ;;
+esac
+
+case "$KIRO_STATUS" in
+  guidance)
+    summary_lines+=("Kiro:        Detected — run 'dcg install --kiro --agent <name>' per agent")
+    ;;
+  skipped|"")
+    : # not detected; no line
     ;;
 esac
 

@@ -716,6 +716,8 @@ List all packs: `dcg packs --verbose`
 | `dcg packs` | List enabled packs |
 | `dcg packs --verbose` | List all packs with pattern counts |
 | `dcg scan .` | Scan codebase for destructive patterns |
+| `dcg install --kiro --agent <name>` | Install the Kiro `preToolUse` hook into `~/.kiro/agents/<name>.json` (user/global agent; built-ins rejected) |
+| `dcg uninstall --kiro --agent <name>` | Remove the marker-owned dcg hook from that Kiro agent |
 | `dcg --version` | Show version and build info |
 
 ---
