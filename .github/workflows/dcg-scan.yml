@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
 
           if [ "$DCG_VERSION" = "latest" ]; then
-            VERSION=$(curl -fsSL https://api.github.com/repos/Dicklesworthstone/destructive_command_guard/releases/latest | jq -er '.tag_name | select(type == "string" and length > 0)')
+            VERSION=$(curl -fsSL https://api.github.com/repos/bootswithdefer/destructive_command_guard/releases/latest | jq -er '.tag_name | select(type == "string" and length > 0)')
           else
             VERSION="$DCG_VERSION"
           fi
@@ -58,7 +58,7 @@ jobs:
           fi
 
           ARCHIVE="dcg-x86_64-unknown-linux-musl.tar.xz"
-          DOWNLOAD_URL="https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/${VERSION}/${ARCHIVE}"
+          DOWNLOAD_URL="https://github.com/bootswithdefer/destructive_command_guard/releases/download/${VERSION}/${ARCHIVE}"
           CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 
           WORK_DIR=$(mktemp -d "${RUNNER_TEMP}/dcg-scan.XXXXXX")
