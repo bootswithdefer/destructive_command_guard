@@ -13513,16 +13513,34 @@ fn list_kiro_user_agents() -> Vec<String> {
     names
 }
 
-/// The dcg-owned Kiro hook entry: `{ "name": "dcg-guard", "matcher": "shell",
-/// "command": "<abs dcg path>" }`.
-fn kiro_dcg_hook_entry() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let executable = current_dcg_executable()?;
-    let command = executable.to_string_lossy().into_owned();
-    Ok(serde_json::json!({
+/// The dcg-owned Kiro hook entry in **object format**: `{ "name": "dcg-guard",
+/// "matcher": "shell", "command": "<abs dcg path>" }`. Used when the agent's
+/// `hooks` field is (or becomes) the trigger-keyed object map.
+fn kiro_dcg_object_entry(command: &str) -> serde_json::Value {
+    serde_json::json!({
         "name": KIRO_DCG_HOOK_NAME,
         "matcher": KIRO_SHELL_MATCHER,
         "command": command,
-    }))
+    })
+}
+
+/// The dcg-owned Kiro hook entry in **array format**: a flat hook document with
+/// an explicit `trigger` and an `action` object, e.g. `{ "name": "dcg-guard",
+/// "trigger": "preToolUse", "matcher": "shell", "action": { "type": "command",
+/// "command": "<abs dcg path>" } }`. Used when the agent's `hooks` field is the
+/// flat array form (both formats are first-class in Kiro).
+fn kiro_dcg_array_entry(command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": KIRO_DCG_HOOK_NAME,
+        "trigger": KIRO_PRE_TOOL_USE_EVENT,
+        "matcher": KIRO_SHELL_MATCHER,
+        "action": { "type": "command", "command": command },
+    })
+}
+
+/// Resolve the absolute dcg executable path for a hook `command` field.
+fn kiro_dcg_command() -> Result<String, Box<dyn std::error::Error>> {
+    Ok(current_dcg_executable()?.to_string_lossy().into_owned())
 }
 
 /// Whether a `preToolUse` hook entry is dcg-owned (carries the `dcg-guard`
@@ -13546,15 +13564,20 @@ fn remove_dcg_entries_from_kiro_pre_tool_use(hooks_pre: &mut Vec<serde_json::Val
 /// preserving every other field and hook. Returns `Ok(true)` when the config
 /// changed (or `force` is set).
 ///
-/// The agent config's `hooks` field may be absent, an object keyed by trigger
-/// (`{"preToolUse": [ ... ]}`), or an array of hook documents. dcg writes into
-/// the object form's `preToolUse` array — the documented default — creating
-/// the structure when absent. An existing dcg entry (by marker name) is
-/// replaced so the command path refreshes; other entries are preserved.
+/// Kiro's `hooks` field accepts two first-class formats (both documented as
+/// functionally equivalent, and Kiro writes the file back in whichever it read):
+///
+///   - **Object form** — `{"hooks": {"preToolUse": [ {matcher, command}, … ]}}`
+///   - **Array form**   — `{"hooks": [ {name, trigger, matcher, action:{…}}, … ]}`
+///
+/// dcg detects which form the agent already uses and inserts the matching
+/// entry shape, defaulting a missing `hooks` field to the object form. An
+/// existing dcg entry (by the `dcg-guard` marker name) is replaced so the
+/// command path refreshes; every other field and hook is preserved.
 fn install_kiro_hook_into_config(
     config: &mut serde_json::Value,
     force: bool,
-    desired_entry: serde_json::Value,
+    command: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let config_obj = config
         .as_object_mut()
@@ -13565,25 +13588,25 @@ fn install_kiro_hook_into_config(
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}));
 
-    // Kiro accepts both an object-keyed hooks map and a flat array of hook
-    // documents. dcg only writes/owns the object form's `preToolUse` array; if
-    // the host uses the array form, converting it would rewrite host-owned
-    // structure, so refuse rather than risk clobbering it.
-    let hooks_obj = hooks.as_object_mut().ok_or(
-        "Kiro agent config uses the array hooks format; dcg install --kiro supports the object \
-         format ({\"hooks\": {\"preToolUse\": [...]}}). Convert the hooks field or add the dcg \
-         entry manually.",
-    )?;
-
-    let pre = hooks_obj
-        .entry(KIRO_PRE_TOOL_USE_EVENT)
-        .or_insert_with(|| serde_json::json!([]));
-    let entries = pre
-        .as_array_mut()
-        .ok_or("Invalid hooks.preToolUse in Kiro agent config (expected a JSON array)")?;
-
-    remove_dcg_entries_from_kiro_pre_tool_use(entries);
-    entries.insert(0, desired_entry);
+    if let Some(hooks_arr) = hooks.as_array_mut() {
+        // Array form: a flat list of hook documents. Replace any dcg-owned
+        // entry and prepend a fresh array-shaped entry.
+        remove_dcg_entries_from_kiro_pre_tool_use(hooks_arr);
+        hooks_arr.insert(0, kiro_dcg_array_entry(command));
+    } else if let Some(hooks_obj) = hooks.as_object_mut() {
+        // Object form (also the default for a freshly-created `{}` hooks map):
+        // insert into the `preToolUse` array.
+        let pre = hooks_obj
+            .entry(KIRO_PRE_TOOL_USE_EVENT)
+            .or_insert_with(|| serde_json::json!([]));
+        let entries = pre
+            .as_array_mut()
+            .ok_or("Invalid hooks.preToolUse in Kiro agent config (expected a JSON array)")?;
+        remove_dcg_entries_from_kiro_pre_tool_use(entries);
+        entries.insert(0, kiro_dcg_object_entry(command));
+    } else {
+        return Err("Invalid Kiro agent config: `hooks` must be an object or an array".into());
+    }
 
     let changed = force || serde_json::Value::Object(config_obj.clone()) != original;
     Ok(changed)
@@ -13628,7 +13651,7 @@ fn install_kiro_hook_at(
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut config = read_kiro_agent_config(path)?;
-    let changed = install_kiro_hook_into_config(&mut config, force, kiro_dcg_hook_entry()?)?;
+    let changed = install_kiro_hook_into_config(&mut config, force, &kiro_dcg_command()?)?;
     if changed {
         let content = serde_json::to_string_pretty(&config)?;
         std::fs::write(path, content)?;
@@ -21144,14 +21167,14 @@ mod tests {
             "tools": ["shell"],
             "prompt": "be careful"
         });
-        let changed = install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/opt/dcg"))
-            .expect("install ok");
+        let changed =
+            install_kiro_hook_into_config(&mut config, false, "/opt/dcg").expect("install ok");
         assert!(changed);
         // Host fields preserved.
         assert_eq!(config["name"], "my-agent");
         assert_eq!(config["tools"], serde_json::json!(["shell"]));
         assert_eq!(config["prompt"], "be careful");
-        // dcg entry created under hooks.preToolUse.
+        // dcg entry created under hooks.preToolUse in object form.
         let entries = kiro_pre_tool_use(&config);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0], kiro_entry_for("/opt/dcg"));
@@ -21162,13 +21185,13 @@ mod tests {
         let mut config = serde_json::json!({
             "hooks": { "preToolUse": [ kiro_entry_for("/opt/dcg") ] }
         });
-        let changed = install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/opt/dcg"))
-            .expect("install ok");
+        let changed =
+            install_kiro_hook_into_config(&mut config, false, "/opt/dcg").expect("install ok");
         assert!(!changed, "identical entry must be a no-op");
         assert_eq!(kiro_pre_tool_use(&config).len(), 1);
 
-        let changed = install_kiro_hook_into_config(&mut config, true, kiro_entry_for("/opt/dcg"))
-            .expect("install ok");
+        let changed =
+            install_kiro_hook_into_config(&mut config, true, "/opt/dcg").expect("install ok");
         assert!(changed, "--force always reports a rewrite");
         assert_eq!(kiro_pre_tool_use(&config).len(), 1);
     }
@@ -21186,8 +21209,8 @@ mod tests {
                 ]
             }
         });
-        let changed = install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/new/dcg"))
-            .expect("install ok");
+        let changed =
+            install_kiro_hook_into_config(&mut config, false, "/new/dcg").expect("install ok");
         assert!(changed);
 
         let entries = kiro_pre_tool_use(&config);
@@ -21207,24 +21230,69 @@ mod tests {
     }
 
     #[test]
-    fn install_kiro_rejects_array_hooks_format_and_bad_shapes() {
-        // Array-format hooks: dcg refuses rather than rewriting host structure.
+    fn install_kiro_supports_array_hooks_format() {
+        // Kiro's array format is first-class; dcg must install into it, not
+        // refuse it (the workhorse-agent regression). Empty array is the
+        // common freshly-created shape.
         let mut config = serde_json::json!({
-            "hooks": [ { "name": "x", "trigger": "agentSpawn", "action": { "type": "command", "command": "git status" } } ]
+            "name": "workhorse",
+            "hooks": [
+                { "name": "keep", "trigger": "agentSpawn", "action": { "type": "command", "command": "git status" } }
+            ]
         });
-        assert!(
-            install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/opt/dcg")).is_err()
-        );
+        let changed =
+            install_kiro_hook_into_config(&mut config, false, "/opt/dcg").expect("install ok");
+        assert!(changed);
+
+        let arr = config["hooks"].as_array().expect("array hooks");
+        assert_eq!(arr.len(), 2, "dcg entry prepended, existing hook kept");
+        // dcg entry is the ARRAY shape: trigger + action.
+        assert_eq!(arr[0]["name"], "dcg-guard");
+        assert_eq!(arr[0]["trigger"], "preToolUse");
+        assert_eq!(arr[0]["matcher"], "shell");
+        assert_eq!(arr[0]["action"]["type"], "command");
+        assert_eq!(arr[0]["action"]["command"], "/opt/dcg");
+        // Host hook preserved.
+        assert_eq!(arr[1]["name"], "keep");
+
+        // Idempotent + refresh: reinstalling replaces the dcg entry in place.
+        let changed =
+            install_kiro_hook_into_config(&mut config, false, "/opt/dcg").expect("reinstall ok");
+        assert!(!changed, "identical array entry is a no-op");
+        assert_eq!(config["hooks"].as_array().unwrap().len(), 2);
+
+        let changed =
+            install_kiro_hook_into_config(&mut config, false, "/new/dcg").expect("refresh ok");
+        assert!(changed, "changed command path rewrites");
+        let arr = config["hooks"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "still one dcg entry + the host hook");
+        assert_eq!(arr[0]["action"]["command"], "/new/dcg");
+    }
+
+    #[test]
+    fn install_kiro_into_empty_array_hooks() {
+        // The exact workhorse shape: hooks is an empty array.
+        let mut config = serde_json::json!({ "name": "workhorse", "hooks": [] });
+        let changed =
+            install_kiro_hook_into_config(&mut config, false, "/opt/dcg").expect("install ok");
+        assert!(changed);
+        let arr = config["hooks"].as_array().expect("array hooks");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["trigger"], "preToolUse");
+        assert_eq!(arr[0]["action"]["command"], "/opt/dcg");
+    }
+
+    #[test]
+    fn install_kiro_rejects_bad_shapes() {
         // Top-level not an object.
         let mut config = serde_json::json!([]);
-        assert!(
-            install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/opt/dcg")).is_err()
-        );
-        // preToolUse present but not an array.
+        assert!(install_kiro_hook_into_config(&mut config, false, "/opt/dcg").is_err());
+        // preToolUse present but not an array (object hooks form).
         let mut config = serde_json::json!({ "hooks": { "preToolUse": {} } });
-        assert!(
-            install_kiro_hook_into_config(&mut config, false, kiro_entry_for("/opt/dcg")).is_err()
-        );
+        assert!(install_kiro_hook_into_config(&mut config, false, "/opt/dcg").is_err());
+        // hooks is a scalar (neither object nor array).
+        let mut config = serde_json::json!({ "hooks": "nope" });
+        assert!(install_kiro_hook_into_config(&mut config, false, "/opt/dcg").is_err());
     }
 
     #[test]
