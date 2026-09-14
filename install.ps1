@@ -2050,6 +2050,8 @@ function Detect-Agents {
     'Reasonix' = ((@($reasonixHomes | Where-Object {
           Test-Path -LiteralPath $_ -PathType Container -ErrorAction SilentlyContinue
         }).Count -gt 0) -or (_has 'reasonix'))
+    'Kiro'    = ((_dir '.kiro') -or (_has 'kiro-cli') -or
+      (-not [string]::IsNullOrEmpty($env:KIRO_SESSION_ID)))
   }
 }
 
@@ -2057,7 +2059,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp', 'Crush', 'Reasonix')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit', 'Omp', 'Crush', 'Reasonix', 'Kiro')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -2571,6 +2573,17 @@ if ($EasyMode -and $detectedAgents['Agy']) {
   } catch {
     Write-Warn "Antigravity (agy) hook configuration failed: $_"
   }
+}
+
+# Kiro (`kiro-cli`): cannot be auto-configured. Kiro hooks live inside a
+# per-agent config (~/.kiro/agents/<name>.json); there is no global hook file,
+# and the built-in agents (kiro_default/kiro_guide/kiro_planner) cannot be
+# edited. Print guidance so the operator guards a specific agent explicitly.
+if ($detectedAgents['Kiro']) {
+  Write-Host ""
+  Write-Info "Kiro detected. Kiro stores hooks per agent (~/.kiro/agents/<name>.json); there is no global hook file."
+  Write-Info "Guard a specific agent (built-in agents cannot be edited) by running:"
+  Write-Host "  dcg install --kiro --agent <name>"
 }
 
 # Under -EasyMode, add a PowerShell-profile startup check that warns if Claude
