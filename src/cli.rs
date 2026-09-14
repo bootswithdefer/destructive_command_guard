@@ -13538,9 +13538,59 @@ fn kiro_dcg_array_entry(command: &str) -> serde_json::Value {
     })
 }
 
-/// Resolve the absolute dcg executable path for a hook `command` field.
+/// Choose the most durable absolute command path to record in a Kiro hook.
+///
+/// Pure decision helper (no I/O) so it is unit-testable. Inputs:
+///   - `path_resolved`: the absolute path `dcg` resolves to on `PATH` **without
+///     following symlinks** (e.g. `/home/linuxbrew/.linuxbrew/bin/dcg`), if any.
+///   - `current_exe`: `std::env::current_exe()`, which on Linux/macOS is
+///     canonicalized — for a Homebrew cask install this is the version-pinned
+///     Caskroom target (`.../Caskroom/dcg/0.16.1/dcg`) that a later
+///     `brew upgrade` deletes, silently breaking the hook.
+///
+/// Preference: the stable PATH entry when it is absolute, because it survives
+/// upgrades; otherwise the canonicalized current-exe path. Both are absolute,
+/// preserving the "never a bare `dcg`" safety requirement (a hook subprocess
+/// may not inherit the interactive shell's PATH).
+fn choose_stable_hook_command(
+    path_resolved: Option<&std::path::Path>,
+    current_exe: &std::path::Path,
+) -> std::path::PathBuf {
+    match path_resolved {
+        Some(p) if p.is_absolute() => p.to_path_buf(),
+        _ => current_exe.to_path_buf(),
+    }
+}
+
+/// Resolve `dcg` on `PATH` to an absolute path **without canonicalizing**, so a
+/// symlink like Homebrew's `bin/dcg` is returned as-is rather than resolved to
+/// its version-pinned target. Returns `None` when no such stable entry exists.
+fn path_resolved_dcg(exe_file_name: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(exe_file_name);
+        // Require an absolute path to an existing file. `symlink_metadata`
+        // does NOT follow the final symlink, but existence via `exists()`
+        // (which does follow) confirms the target is present too.
+        if candidate.is_absolute() && candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Resolve the absolute, upgrade-stable dcg command path for a hook `command`
+/// field. Prefers the PATH-resolved `bin/dcg` symlink over the canonicalized
+/// `current_exe()` (which, under a Homebrew cask, is the version-pinned
+/// Caskroom target that disappears on the next upgrade).
 fn kiro_dcg_command() -> Result<String, Box<dyn std::error::Error>> {
-    Ok(current_dcg_executable()?.to_string_lossy().into_owned())
+    let current = current_dcg_executable()?;
+    let path_resolved = current.file_name().and_then(path_resolved_dcg);
+    let chosen = choose_stable_hook_command(path_resolved.as_deref(), &current);
+    Ok(chosen.to_string_lossy().into_owned())
 }
 
 /// Whether a `preToolUse` hook entry is dcg-owned (carries the `dcg-guard`
@@ -21350,6 +21400,77 @@ mod tests {
     fn kiro_agent_config_path_is_user_scoped() {
         let path = kiro_agent_config_path("rust-dev");
         assert!(path.ends_with(".kiro/agents/rust-dev.json"));
+    }
+
+    #[test]
+    fn choose_stable_hook_command_prefers_absolute_path_entry() {
+        // The Homebrew case: PATH has the stable bin symlink, current_exe is
+        // the canonicalized (version-pinned) Caskroom target. Prefer the
+        // stable symlink so a later `brew upgrade` does not break the hook.
+        let stable = std::path::Path::new("/home/linuxbrew/.linuxbrew/bin/dcg");
+        let caskroom = std::path::Path::new("/home/linuxbrew/.linuxbrew/Caskroom/dcg/0.16.1/dcg");
+        assert_eq!(
+            choose_stable_hook_command(Some(stable), caskroom),
+            stable.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn choose_stable_hook_command_falls_back_to_current_exe() {
+        let caskroom = std::path::Path::new("/home/linuxbrew/.linuxbrew/Caskroom/dcg/0.16.1/dcg");
+        // No PATH entry → use current_exe.
+        assert_eq!(
+            choose_stable_hook_command(None, caskroom),
+            caskroom.to_path_buf()
+        );
+        // A relative PATH candidate is not durable/safe → fall back to the
+        // absolute current_exe.
+        let relative = std::path::Path::new("bin/dcg");
+        assert_eq!(
+            choose_stable_hook_command(Some(relative), caskroom),
+            caskroom.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn path_resolved_dcg_finds_absolute_entry_without_canonicalizing() {
+        // A symlinked `dcg` in a PATH dir must be returned by its symlink path,
+        // NOT its resolved target (mirrors Homebrew's bin/dcg → Caskroom link).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bindir = dir.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        // Real target elsewhere.
+        let target = dir.path().join("target-dcg");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        let link = bindir.join("dcg");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(&link, b"#!/bin/sh\n").unwrap();
+
+        // Prepend our bin dir to PATH for the duration of the check.
+        let orig = std::env::var_os("PATH");
+        let mut dirs = vec![bindir.clone()];
+        if let Some(ref p) = orig {
+            dirs.extend(std::env::split_paths(p));
+        }
+        let joined = std::env::join_paths(dirs).unwrap();
+        // SAFETY: single-threaded test; PATH restored below.
+        unsafe { std::env::set_var("PATH", &joined) };
+
+        let resolved = path_resolved_dcg(std::ffi::OsStr::new("dcg"));
+
+        // Restore PATH before asserting.
+        match orig {
+            Some(p) => unsafe { std::env::set_var("PATH", p) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        let resolved = resolved.expect("dcg found on PATH");
+        assert!(resolved.is_absolute());
+        // Returned by the symlink path in our bin dir, not the target file.
+        assert_eq!(resolved, link);
+        assert_ne!(resolved, target);
     }
 
     #[test]
